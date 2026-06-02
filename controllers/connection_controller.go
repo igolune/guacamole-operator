@@ -311,6 +311,10 @@ func (r *ConnectionReconciler) guacamoleEventRequestMapFunc(indexField string) g
 		var requests []reconcile.Request
 
 		for _, c := range connections.Items {
+			if c.Spec.Permissions == nil {
+				continue
+			}
+
 			if !slices.Contains(c.Spec.Permissions.Users, v1alpha1.ConnectionUser{ID: obj.Username()}) {
 				continue
 			}
