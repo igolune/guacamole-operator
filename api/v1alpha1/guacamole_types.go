@@ -18,6 +18,7 @@ package v1alpha1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	addonv1alpha1 "sigs.k8s.io/kubebuilder-declarative-pattern/pkg/patterns/addon/pkg/apis/v1alpha1"
 )
 
@@ -104,7 +105,10 @@ type GuacamoleList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&Guacamole{}, &GuacamoleList{})
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(SchemeGroupVersion, &Guacamole{}, &GuacamoleList{})
+		return nil
+	})
 }
 
 // Extension...
