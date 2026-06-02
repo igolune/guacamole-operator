@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/guacamole-operator/guacamole-operator/internal/client/gen"
 )
@@ -95,7 +96,10 @@ type ConnectionList struct {
 }
 
 func init() {
-	SchemeBuilder.Register(&Connection{}, &ConnectionList{})
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(SchemeGroupVersion, &Connection{}, &ConnectionList{})
+		return nil
+	})
 }
 
 // GuacamoleRef...
