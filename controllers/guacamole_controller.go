@@ -60,7 +60,7 @@ type GuacamoleReconciler struct {
 type Listener interface {
 	Add(namespace, name, url string)
 	Remove(namespace, name string)
-	Listen(ctx context.Context, eventCh chan<- GuacamoleWrappedEvent, errCh chan<- error, doneCh chan<- struct{})
+	Listen(ctx context.Context, doneCh chan<- struct{})
 }
 
 // +kubebuilder:rbac:groups=guacamole-operator.github.io,resources=guacamoles,verbs=get;list;watch;create;update;patch;delete

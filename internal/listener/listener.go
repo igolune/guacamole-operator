@@ -34,17 +34,35 @@ type Listener struct {
 	// WebSocket clients per Guacamole instance.
 	clients map[id]*client
 	mutex   sync.RWMutex
+	closed  bool
+
+	eventCh chan<- controllers.GuacamoleWrappedEvent
+	errCh   chan<- error
+	wg      sync.WaitGroup
+}
+
+// New creates a Listener forwarding processed events and errors to the
+// provided output channels.
+func New(eventCh chan<- controllers.GuacamoleWrappedEvent, errCh chan<- error) *Listener {
+	return &Listener{
+		clients: make(map[id]*client),
+		eventCh: eventCh,
+		errCh:   errCh,
+	}
 }
 
 // Add a WebSocket Client for a Guacamole Instance.
 func (l *Listener) Add(namespace, name, URL string) {
-	if l.clients == nil {
-		l.clients = make(map[id]*client)
-	}
-
 	id := id{
 		Namespace: namespace,
 		Name:      name,
+	}
+
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	if l.closed {
+		return
 	}
 
 	if _, exists := l.clients[id]; exists {
@@ -55,102 +73,110 @@ func (l *Listener) Add(namespace, name, URL string) {
 	dataCh := make(chan []byte, 1)
 	errCh := make(chan error, 1)
 
-	client := client{
+	c := &client{
 		Client: ws.New(URL),
 		dataCh: dataCh,
 		errCh:  errCh,
 		cancel: cancel,
 	}
+	l.clients[id] = c
 
-	go client.Read(ctx, dataCh, errCh)
-	l.clients[id] = &client
+	go c.Read(ctx, dataCh, errCh)
+
+	l.wg.Add(1)
+	go l.forward(ctx, id, c)
 }
 
-// Remove a WebSocket client for a Guacamole instance
-// and close the connection.
+// forward blocks on the client's channels and forwards processed events to the
+// listener's shared output channels using context-aware sends.
+func (l *Listener) forward(ctx context.Context, id id, c *client) {
+	defer l.wg.Done()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case msg := <-c.dataCh:
+			e, err := newEvent(id, msg)
+			if err != nil {
+				select {
+				case l.errCh <- fmt.Errorf("%s in %s: %w", id.Name, id.Namespace, err):
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
+
+			if e == nil {
+				continue
+			}
+
+			select {
+			case l.eventCh <- *e:
+			case <-ctx.Done():
+				return
+			}
+
+		case err := <-c.errCh:
+			select {
+			case l.errCh <- fmt.Errorf("%s in %s: %w", id.Name, id.Namespace, err):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// Remove a WebSocket client for a Guacamole instance and close the connection.
 func (l *Listener) Remove(namespace, name string) {
 	id := id{
 		Namespace: namespace,
 		Name:      name,
 	}
 
-	client, exists := l.clients[id]
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
+	c, exists := l.clients[id]
 	if !exists {
 		return
 	}
 
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-
-	client.cancel()
-	client.Close()
+	c.cancel()
+	c.Close()
 
 	delete(l.clients, id)
 }
 
-// Listen for events from all clients.
-func (l *Listener) Listen(ctx context.Context, eventCh chan<- controllers.GuacamoleWrappedEvent, errCh chan<- error, doneCh chan<- struct{}) {
-	for {
-		if err := ctx.Err(); err != nil {
-			break
-		}
+// Listen blocks until the context is cancelled, then shuts down all clients
+// and their forwarders before signalling completion via doneCh.
+func (l *Listener) Listen(ctx context.Context, doneCh chan<- struct{}) {
+	<-ctx.Done()
 
-		for id, client := range l.clients {
-			func() {
-				l.mutex.RLock()
-				defer l.mutex.RUnlock()
-
-				select {
-				case msg := <-client.dataCh:
-					user, ok, err := getEventUser(msg)
-					if err != nil {
-						errCh <- fmt.Errorf("%s in %s: %w", id.Name, id.Namespace, err)
-					}
-
-					if !ok {
-						break
-					}
-
-					e := controllers.GuacamoleWrappedEvent{
-						Object: &event{
-							namespace: id.Namespace,
-							name:      id.Name,
-							user:      user,
-						},
-					}
-
-					eventCh <- e
-
-				case err := <-client.errCh:
-					errCh <- fmt.Errorf("%s in %s: %w", id.Name, id.Namespace, err)
-
-				default:
-				}
-			}()
-		}
+	l.mutex.Lock()
+	l.closed = true
+	for id, c := range l.clients {
+		c.cancel()
+		c.Close()
+		delete(l.clients, id)
 	}
+	l.mutex.Unlock()
 
-	// Cancel all `Read` goroutines and close the client's connection.
-	for _, client := range l.clients {
-		client.cancel()
-		client.Close()
-	}
-
+	l.wg.Wait()
 	close(doneCh)
 }
 
-// getEventUser checks if a CloudEvent is a user related event
-// and extracts the username. Only successful create, update
-// or delete events are considered.
-func getEventUser(msg []byte) (string, bool, error) {
-	// Read CloudEvent.
+// newEvent parses a raw WebSocket message and, if it is a relevant user
+// success event, returns a fully constructed GuacamoleWrappedEvent. It returns
+// (nil, nil) when the message is valid but not a user success event (i.e. the
+// caller should skip it) and (nil, err) on a parse failure.
+func newEvent(id id, msg []byte) (*controllers.GuacamoleWrappedEvent, error) {
 	ce := cloudevents.NewEvent()
-	err := json.Unmarshal(msg, &ce)
-	if err != nil {
-		return "", false, err
+	if err := json.Unmarshal(msg, &ce); err != nil {
+		return nil, err
 	}
 
-	// Filter all valid user success events.
 	validEventTypes := []string{
 		"io.github.guacamole_operator.user.success.create",
 		"io.github.guacamole_operator.user.success.update",
@@ -158,15 +184,19 @@ func getEventUser(msg []byte) (string, bool, error) {
 	}
 
 	if !slices.Contains(validEventTypes, ce.Context.GetType()) {
-		return "", false, nil
+		return nil, nil
 	}
 
-	// Extract username from event.
-	var user userData
-	err = json.Unmarshal(ce.Data(), &user)
-	if err != nil {
-		return "", false, err
+	var u userData
+	if err := json.Unmarshal(ce.Data(), &u); err != nil {
+		return nil, err
 	}
 
-	return user.Username, true, nil
+	return &controllers.GuacamoleWrappedEvent{
+		Object: &event{
+			namespace: id.Namespace,
+			name:      id.Name,
+			user:      u.Username,
+		},
+	}, nil
 }
