@@ -138,19 +138,19 @@ func main() {
 	ctrl.SetLogger(logger)
 
 	// Configure and start event listener if enabled.
-	eventListener := &listener.Listener{}
 	triggerCh := make(chan controllers.GuacamoleWrappedEvent, 1)
+	listenerErrCh := make(chan error, 1)
+	eventListener := listener.New(triggerCh, listenerErrCh)
 	if enableGuacEventListener {
 		ctx, cancel := context.WithCancel(context.Background())
 		doneCh := make(chan struct{})
-		errCh := make(chan error, 1)
 
 		defer func() {
 			cancel()
 			<-doneCh
 		}()
 
-		go eventListener.Listen(ctx, triggerCh, errCh, doneCh)
+		go eventListener.Listen(ctx, doneCh)
 	}
 
 	// Setup controller manager.
